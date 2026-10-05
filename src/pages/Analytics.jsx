@@ -93,7 +93,7 @@ function Analytics() {
     if (!isVisibleRef.current) return
 
     try {
-      const { data } = await axios.get('/traffic_status')
+      const { data } = await axios.get('/api/traffic_status')
       const count = data.vehicle_count || 0
       const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 

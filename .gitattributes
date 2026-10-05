@@ -2,3 +2,4 @@
 *.pkl filter=lfs diff=lfs merge=lfs -text
 *.pptx filter=lfs diff=lfs merge=lfs -text
 *.docx filter=lfs diff=lfs merge=lfs -text
+demo_traffic.mp4 filter=lfs diff=lfs merge=lfs -text
