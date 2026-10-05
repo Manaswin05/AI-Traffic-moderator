@@ -27,6 +27,7 @@ function Dashboard() {
   const [traffic, setTraffic] = useState({ traffic_light: 'red', vehicle_count: 0 })
   const [logs, setLogs] = useState(INITIAL_LOGS)
   const [videoSource, setVideoSource] = useState('video')
+  const [feedKey, setFeedKey] = useState(0)   // increment to force img reconnect
   const [chartLabels, setChartLabels] = useState([])
   const [chartValues, setChartValues] = useState([])
   const [isVideoVisible, setIsVideoVisible] = useState(true)
@@ -143,6 +144,10 @@ function Dashboard() {
     try {
       await axios.post('/set_video_source', { source })
       setVideoSource(source)
+      // Force the <img> to drop the old MJPEG connection and open a fresh one.
+      // Simply changing src to the same URL does nothing — incrementing feedKey
+      // causes React to remount the element with a new cache-busting query param.
+      setFeedKey(k => k + 1)
 
       const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
       setLogs(prev => {
@@ -167,8 +172,8 @@ function Dashboard() {
   const densityPct = Math.min(100, Math.round((traffic.vehicle_count / 25) * 100))
   const signalColorClass = `text-${traffic.traffic_light === 'red' ? 'red' : traffic.traffic_light === 'yellow' ? 'yellow' : 'green'}`
 
-  // Video feed URL with cache-bust to force reconnect after tab becomes visible again
-  const videoSrc = isVideoVisible ? '/video_feed' : ''
+  // Video feed URL — feedKey increment forces a fresh MJPEG connection after source switch
+  const videoSrc = isVideoVisible ? `/video_feed?k=${feedKey}` : ''
 
   return (
     <>

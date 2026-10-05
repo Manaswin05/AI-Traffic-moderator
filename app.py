@@ -547,6 +547,23 @@ def process_frame():
 
 
 # ---------------------------
+# Queue drain helper (used on source switch)
+# ---------------------------
+def _drain_queues():
+    """
+    Flush frame_queue and result_queue after a source switch so stale frames
+    from the previous source don't bleed into the new stream.
+    Called from set_video_source() — safe to call from any thread.
+    """
+    for q in (frame_queue, result_queue):
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+
+
+# ---------------------------
 # Flask Routes
 # ---------------------------
 @app.route('/set_video_source', methods=['POST'])
@@ -555,11 +572,8 @@ def set_video_source():
     data = request.json
     source_type = data.get('source', 'video')
 
-    with video_lock:
-        if cap is not None:
-            cap.release()
-
     if source_type == 'webcam':
+        new_cap = None
         for index in [0, 1, 2]:
             temp_cap = cv2.VideoCapture(index)
             if temp_cap.isOpened():
@@ -567,29 +581,57 @@ def set_video_source():
                 temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 temp_cap.set(cv2.CAP_PROP_FPS, 30)
-                with video_lock:
-                    cap = temp_cap
-                    is_video_file = False
-                return jsonify({"status": "success", "message": f"Switched to webcam {index}"})
+                # Flush the first few frames so the webcam stabilises before streaming
+                for _ in range(5):
+                    temp_cap.read()
+                ret, frame = temp_cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    new_cap = temp_cap
+                    new_is_file = False
+                    found_index = index
+                    break
+                else:
+                    temp_cap.release()
 
+        if new_cap is None:
+            return jsonify({"status": "error", "message": "No webcam found"}), 404
+
+        # Swap atomically under the lock so FrameCaptureThread never reads
+        # a half-released capture object
         with video_lock:
-            cap = None
-            is_video_file = False
-        return jsonify({"status": "error", "message": "No webcam found"}), 404
+            old_cap = cap
+            cap = new_cap
+            is_video_file = new_is_file
+
+        if old_cap is not None:
+            old_cap.release()
+
+        # Flush stale frames from previous source out of the pipeline queues
+        _drain_queues()
+
+        return jsonify({"status": "success", "message": f"Switched to webcam {found_index}"})
 
     else:
         video_path = os.environ.get("VIDEO_SOURCE", "demo_traffic.mp4")
-        if os.path.exists(video_path):
-            temp_cap = cv2.VideoCapture(video_path)
-            with video_lock:
-                cap = temp_cap
-                is_video_file = True
-            return jsonify({"status": "success", "message": "Switched to demo video"})
+        if not os.path.exists(video_path):
+            return jsonify({"status": "error", "message": "Demo video not found"}), 404
+
+        new_cap = cv2.VideoCapture(video_path)
+        if not new_cap.isOpened():
+            new_cap.release()
+            return jsonify({"status": "error", "message": "Could not open demo video"}), 500
 
         with video_lock:
-            cap = None
-            is_video_file = False
-        return jsonify({"status": "error", "message": "Demo video not found"}), 404
+            old_cap = cap
+            cap = new_cap
+            is_video_file = True
+
+        if old_cap is not None:
+            old_cap.release()
+
+        _drain_queues()
+
+        return jsonify({"status": "success", "message": "Switched to demo video"})
 
 
 @app.route('/video_feed')
