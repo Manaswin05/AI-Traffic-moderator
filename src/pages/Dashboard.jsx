@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import axios from 'axios'
 import { Line } from 'react-chartjs-2'
 import {
@@ -18,14 +18,28 @@ const INITIAL_LOGS = [
   { time: '--:--:--', msg: 'Awaiting first data cycle…', type: 'primary' },
 ]
 
+// Maximum number of data points to keep in history
+const MAX_CHART_POINTS = 24
+const MAX_LOG_ENTRIES = 30
+const POLL_INTERVAL_MS = 5000
+
 function Dashboard() {
   const [traffic, setTraffic] = useState({ traffic_light: 'red', vehicle_count: 0 })
   const [logs, setLogs] = useState(INITIAL_LOGS)
   const [videoSource, setVideoSource] = useState('video')
-  const [chartData, setChartData] = useState({
-    labels: [],
+  const [chartLabels, setChartLabels] = useState([])
+  const [chartValues, setChartValues] = useState([])
+  const [isVideoVisible, setIsVideoVisible] = useState(true)
+
+  const prevSignal = useRef(traffic.traffic_light)
+  const pollTimerRef = useRef(null)
+  const videoRef = useRef(null)
+
+  // ─── Memoized chart dataset (only re-creates when data changes) ───
+  const chartData = useMemo(() => ({
+    labels: chartLabels,
     datasets: [{
-      data: [],
+      data: chartValues,
       borderColor: 'rgba(255,255,255,0.7)',
       backgroundColor: 'rgba(255,255,255,0.04)',
       tension: 0.4,
@@ -33,74 +47,13 @@ function Dashboard() {
       pointRadius: 0,
       borderWidth: 1.5,
     }],
-  })
-  const prevSignal = useRef(traffic.traffic_light)
+  }), [chartLabels, chartValues])
 
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        const { data } = await axios.get('/traffic_status')
-        setTraffic(data)
-
-        const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-
-        setLogs(prev => {
-          const next = [...prev]
-          if (next.length === 1 && next[0].msg.includes('Awaiting')) next.pop()
-
-          next.unshift({ time: t, msg: `Vehicle stream registered (${data.vehicle_count})`, type: '' })
-
-          if (data.traffic_light !== prevSignal.current) {
-            next.unshift({ time: t, msg: `Signal cycle changed → ${data.traffic_light.toUpperCase()}`, type: 'primary' })
-            prevSignal.current = data.traffic_light
-          }
-
-          if (data.vehicle_count >= 15) {
-            next.unshift({ time: t, msg: 'Density threshold exceeded (High)', type: 'primary' })
-          }
-
-          return next.slice(0, 30)
-        })
-
-        setChartData(prev => {
-          const labels = [...prev.labels, t]
-          const vals = [...prev.datasets[0].data, data.vehicle_count]
-          if (labels.length > 24) { labels.shift(); vals.shift() }
-          return { ...prev, labels, datasets: [{ ...prev.datasets[0], data: vals }] }
-        })
-      } catch (_) {}
-    }
-    poll()
-    const id = setInterval(poll, 5000)
-    return () => clearInterval(id)
-  }, [])
-
-  const switchVideoSource = async (source) => {
-    try {
-      await axios.post('/set_video_source', { source })
-      setVideoSource(source)
-      
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      setLogs(prev => {
-        const next = [...prev]
-        next.unshift({ time: t, msg: `Video source switched to ${source}`, type: 'primary' })
-        return next.slice(0, 30)
-      })
-    } catch (err) {
-      console.error("Failed to switch source", err)
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      setLogs(prev => {
-        const next = [...prev]
-        next.unshift({ time: t, msg: `Failed to switch to ${source}`, type: 'error' })
-        return next.slice(0, 30)
-      })
-    }
-  }
-
-  const chartOpts = {
+  // ─── Memoized chart options (static — never changes) ───
+  const chartOpts = useMemo(() => ({
     responsive: true,
     maintainAspectRatio: false,
-    animation: { duration: 400 },
+    animation: { duration: 300 },
     plugins: {
       legend: { display: false },
       tooltip: {
@@ -129,12 +82,93 @@ function Dashboard() {
         ticks: { color: '#8e9192', font: { size: 9, family: 'JetBrains Mono' }, maxTicksLimit: 4, maxRotation: 0 },
       },
     },
-  }
+  }), [])
 
+  // ─── Stable polling callback ───
+  const poll = useCallback(async () => {
+    try {
+      const { data } = await axios.get('/traffic_status')
+      setTraffic(data)
+
+      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+
+      setLogs(prev => {
+        const next = [...prev]
+        if (next.length === 1 && next[0].msg.includes('Awaiting')) next.pop()
+
+        next.unshift({ time: t, msg: `Vehicle stream registered (${data.vehicle_count})`, type: '' })
+
+        if (data.traffic_light !== prevSignal.current) {
+          next.unshift({ time: t, msg: `Signal cycle changed → ${data.traffic_light.toUpperCase()}`, type: 'primary' })
+          prevSignal.current = data.traffic_light
+        }
+
+        if (data.vehicle_count >= 15) {
+          next.unshift({ time: t, msg: 'Density threshold exceeded (High)', type: 'primary' })
+        }
+
+        return next.length > MAX_LOG_ENTRIES ? next.slice(0, MAX_LOG_ENTRIES) : next
+      })
+
+      // Update chart arrays separately (avoids recreating the entire dataset object)
+      setChartLabels(prev => {
+        const next = [...prev, t]
+        return next.length > MAX_CHART_POINTS ? next.slice(1) : next
+      })
+      setChartValues(prev => {
+        const next = [...prev, data.vehicle_count]
+        return next.length > MAX_CHART_POINTS ? next.slice(1) : next
+      })
+    } catch (_) { /* network error — silently retry next cycle */ }
+  }, [])
+
+  // ─── Polling lifecycle ───
+  useEffect(() => {
+    poll()
+    pollTimerRef.current = setInterval(poll, POLL_INTERVAL_MS)
+    return () => clearInterval(pollTimerRef.current)
+  }, [poll])
+
+  // ─── Visibility API: pause video stream when tab is hidden ───
+  useEffect(() => {
+    const handleVisibility = () => {
+      setIsVideoVisible(!document.hidden)
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => document.removeEventListener('visibilitychange', handleVisibility)
+  }, [])
+
+  // ─── Switch video source ───
+  const switchVideoSource = useCallback(async (source) => {
+    try {
+      await axios.post('/set_video_source', { source })
+      setVideoSource(source)
+
+      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      setLogs(prev => {
+        const next = [...prev]
+        next.unshift({ time: t, msg: `Video source switched to ${source}`, type: 'primary' })
+        return next.slice(0, MAX_LOG_ENTRIES)
+      })
+    } catch (err) {
+      console.error('Failed to switch source', err)
+      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      setLogs(prev => {
+        const next = [...prev]
+        next.unshift({ time: t, msg: `Failed to switch to ${source}`, type: 'error' })
+        return next.slice(0, MAX_LOG_ENTRIES)
+      })
+    }
+  }, [])
+
+  // ─── Derived display values ───
   const signalLabel = { red: 'Stop', yellow: 'Caution', green: 'Clear' }[traffic.traffic_light] || 'Stop'
   const density = traffic.vehicle_count < 5 ? 'Low' : traffic.vehicle_count < 15 ? 'Moderate' : 'High'
   const densityPct = Math.min(100, Math.round((traffic.vehicle_count / 25) * 100))
   const signalColorClass = `text-${traffic.traffic_light === 'red' ? 'red' : traffic.traffic_light === 'yellow' ? 'yellow' : 'green'}`
+
+  // Video feed URL with cache-bust to force reconnect after tab becomes visible again
+  const videoSrc = isVideoVisible ? '/video_feed' : ''
 
   return (
     <>
@@ -201,7 +235,17 @@ function Dashboard() {
               </span>
             </div>
             <div className="cam-feed">
-              <img src="/video_feed" alt="Live Traffic Feed" />
+              {/* Only render the MJPEG stream when the tab is visible.
+                  This prevents the browser from buffering frames in the background,
+                  which is the #1 cause of memory bloat and eventual lag. */}
+              {videoSrc ? (
+                <img ref={videoRef} src={videoSrc} alt="Live Traffic Feed" />
+              ) : (
+                <div className="cam-paused">
+                  <span className="material-symbols-outlined">visibility_off</span>
+                  <span>Feed paused — tab inactive</span>
+                </div>
+              )}
               <div className="cam-feed-overlay">
                 <span className="cam-chip">HD 1080p</span>
                 <span className="cam-chip">30 FPS</span>
