@@ -35,6 +35,7 @@ pinned: false
 [![Forks](https://img.shields.io/github/forks/Manaswin05/AI-Traffic-Moderator?style=social)](https://github.com/Manaswin05/AI-Traffic-Moderator/network/members)
 [![Issues](https://img.shields.io/github/issues/Manaswin05/AI-Traffic-Moderator)](https://github.com/Manaswin05/AI-Traffic-Moderator/issues)
 [![License](https://img.shields.io/badge/License-Educational-brightgreen?style=flat-square)](#license)
+[![Views](https://komarev.com/ghpvc/?username=Manaswin05-AI-Traffic-Moderator&label=Repo%20Views&color=0e75b6&style=flat)](https://github.com/Manaswin05/AI-Traffic-Moderator)
 
 <br/>
 
