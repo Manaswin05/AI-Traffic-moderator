@@ -59,3 +59,6 @@ models/*.pkl
 
 # Deployment configs
 # (Removed - now tracked for Render deployment)
+
+
+demo_traffic.mp4

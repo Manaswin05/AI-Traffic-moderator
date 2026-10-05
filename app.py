@@ -60,41 +60,20 @@ _device = None  # last successfully loaded device name (for status reporting)
 
 def _load_model_for_device(device_name):
     """
-    Load a YOLO OpenVINO model instance for a specific device.
-    Each InferenceThread gets its own model instance — OpenVINO requires
-    separate Core/model objects per execution context.
-    Returns the loaded YOLO model or raises on failure.
+    Load a YOLO model. Tries PyTorch CPU to ensure it works reliably across environments.
     """
-    OV_MODEL = "models/yolov8n_openvino_model"
-    m = YOLO(OV_MODEL)
+    PT_MODEL = "models/yolov8n.pt"
+    m = YOLO(PT_MODEL)
     dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    m.predict(dummy, device=device_name, imgsz=640, verbose=False)
-    print(f"[+] YOLO worker ready on {device_name} ✓")
+    m.predict(dummy, device="cpu", imgsz=640, verbose=False)
+    print(f"[+] YOLO worker ready on CPU OK")
     return m
-
 
 def _load_best_model():
     """
-    Single-device fallback loader used when dual-device startup fails.
-    Priority: GPU → NPU → CPU (OpenVINO) → CPU-PT (plain PyTorch)
+    Fallback loader if the main one fails.
     """
-    OV_MODEL = "models/yolov8n_openvino_model"
-    PT_MODEL  = "models/yolov8n.pt"
-
-    if os.path.isdir(OV_MODEL):
-        for device in ("GPU", "NPU", "CPU"):
-            try:
-                m = _load_model_for_device(device)
-                return m, device
-            except Exception as e:
-                print(f"[-] OpenVINO {device} unavailable: {e}")
-
-    print("[!] Falling back to PyTorch CPU model.")
-    m = YOLO(PT_MODEL)
-    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    m.predict(dummy, imgsz=640, verbose=False)
-    print("[+] YOLO loaded via PyTorch CPU ✓")
-    return m, "CPU-PT"
+    return _load_model_for_device("cpu"), "CPU"
 
 
 VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
@@ -104,43 +83,14 @@ VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 # Camera / Video Initialization
 # ---------------------------
 def init_camera():
-    # 1. Try a demo video file first (good for cloud/Render deployment)
-    video_path = os.environ.get("VIDEO_SOURCE", "demo_traffic.mp4")
+    # Only use video file as requested
+    video_path = "demo_traffic.mp4"
     if os.path.exists(video_path):
         cap = cv2.VideoCapture(video_path)
         if cap.isOpened():
             print(f"SUCCESS: Using video file: {video_path}")
-            return cap, True  # (capture, is_video_file)
-        else:
-            print(f"WARNING: Found file {video_path} but could not open it (might be a Git LFS pointer).")
-
-    # 2. Try physical webcam only if NOT running in a cloud container
-    is_cloud = os.environ.get("SPACE_ID") or os.environ.get("RENDER") or os.environ.get("PORT") == "7860"
-    if not is_cloud:
-        for index in [0, 1, 2]:
-            try:
-                cam = cv2.VideoCapture(index)
-                if cam.isOpened():
-                    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    cam.set(cv2.CAP_PROP_FPS, 30)
-
-                    for _ in range(5):
-                        cam.read()
-
-                    ret, frame = cam.read()
-                    if ret and frame is not None and frame.size > 0:
-                        print(f"SUCCESS: Camera {index} opened. Shape: {frame.shape}")
-                        return cam, False
-                    else:
-                        cam.release()
-            except Exception:
-                pass
-    else:
-        print("INFO: Headless cloud environment detected. Skipping webcam detection loop.")
-
-    print("WARNING: No camera or video file found. Will stream placeholder frames.")
+            return cap, True
+    print("WARNING: No video file found. Will stream placeholder frames.")
     return None, False
 
 
@@ -385,7 +335,7 @@ class InferenceThread(threading.Thread):
             imgsz=640,
             conf=0.4,   # ignore detections below 40% confidence
             iou=0.45,   # NMS threshold — removes duplicate boxes on same vehicle
-            device=self.device_name,
+            device="cpu",
         )[0]
         vehicles = []
         for box in results.boxes:
@@ -566,81 +516,18 @@ def _drain_queues():
 # ---------------------------
 # Flask Routes
 # ---------------------------
-@app.route('/set_video_source', methods=['POST'])
+@app.route('/api/set_video_source', methods=['POST'])
 def set_video_source():
-    global cap, is_video_file
-    data = request.json
-    source_type = data.get('source', 'video')
-
-    if source_type == 'webcam':
-        new_cap = None
-        for index in [0, 1, 2]:
-            temp_cap = cv2.VideoCapture(index)
-            if temp_cap.isOpened():
-                temp_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                temp_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                temp_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                temp_cap.set(cv2.CAP_PROP_FPS, 30)
-                # Flush the first few frames so the webcam stabilises before streaming
-                for _ in range(5):
-                    temp_cap.read()
-                ret, frame = temp_cap.read()
-                if ret and frame is not None and frame.size > 0:
-                    new_cap = temp_cap
-                    new_is_file = False
-                    found_index = index
-                    break
-                else:
-                    temp_cap.release()
-
-        if new_cap is None:
-            return jsonify({"status": "error", "message": "No webcam found"}), 404
-
-        # Swap atomically under the lock so FrameCaptureThread never reads
-        # a half-released capture object
-        with video_lock:
-            old_cap = cap
-            cap = new_cap
-            is_video_file = new_is_file
-
-        if old_cap is not None:
-            old_cap.release()
-
-        # Flush stale frames from previous source out of the pipeline queues
-        _drain_queues()
-
-        return jsonify({"status": "success", "message": f"Switched to webcam {found_index}"})
-
-    else:
-        video_path = os.environ.get("VIDEO_SOURCE", "demo_traffic.mp4")
-        if not os.path.exists(video_path):
-            return jsonify({"status": "error", "message": "Demo video not found"}), 404
-
-        new_cap = cv2.VideoCapture(video_path)
-        if not new_cap.isOpened():
-            new_cap.release()
-            return jsonify({"status": "error", "message": "Could not open demo video"}), 500
-
-        with video_lock:
-            old_cap = cap
-            cap = new_cap
-            is_video_file = True
-
-        if old_cap is not None:
-            old_cap.release()
-
-        _drain_queues()
-
-        return jsonify({"status": "success", "message": "Switched to demo video"})
+    return jsonify({"status": "error", "message": "Video source switching disabled"}), 400
 
 
-@app.route('/video_feed')
+@app.route('/api/video_feed')
 def video_feed():
     return Response(process_frame(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
-@app.route('/traffic_status')
+@app.route('/api/traffic_status')
 def traffic_status():
     stats = kmeans_system.get_stats()
     active_devices = [t.device_name for t in _inference_threads if t.is_alive()]
@@ -656,13 +543,13 @@ def traffic_status():
     })
 
 
-@app.route('/model_info')
+@app.route('/api/model_info')
 def model_info():
     """Get detailed K-means model information"""
     return jsonify(kmeans_system.get_stats())
 
 
-@app.route('/train_model', methods=['POST'])
+@app.route('/api/train_model', methods=['POST'])
 def train_model():
     """Manually trigger model retraining"""
     kmeans_system.train()
@@ -674,13 +561,13 @@ def train_model():
     })
 
 
-# Serve React frontend for all non-API routes (SPA support)
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_react(path):
-    if path and os.path.exists(os.path.join(app.static_folder, path)):
-        return send_from_directory(app.static_folder, path)
-    return send_from_directory(app.static_folder, 'index.html')
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
+
+@app.errorhandler(404)
+def not_found(e):
+    return app.send_static_file('index.html')
 
 
 # ---------------------------

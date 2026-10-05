@@ -26,7 +26,6 @@ const POLL_INTERVAL_MS = 5000
 function Dashboard() {
   const [traffic, setTraffic] = useState({ traffic_light: 'red', vehicle_count: 0 })
   const [logs, setLogs] = useState(INITIAL_LOGS)
-  const [videoSource, setVideoSource] = useState('video')
   const [feedKey, setFeedKey] = useState(0)   // increment to force img reconnect
   const [chartLabels, setChartLabels] = useState([])
   const [chartValues, setChartValues] = useState([])
@@ -88,7 +87,7 @@ function Dashboard() {
   // ─── Stable polling callback ───
   const poll = useCallback(async () => {
     try {
-      const { data } = await axios.get('/traffic_status')
+      const { data } = await axios.get('/api/traffic_status')
       setTraffic(data)
 
       const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -139,32 +138,7 @@ function Dashboard() {
     return () => document.removeEventListener('visibilitychange', handleVisibility)
   }, [])
 
-  // ─── Switch video source ───
-  const switchVideoSource = useCallback(async (source) => {
-    try {
-      await axios.post('/set_video_source', { source })
-      setVideoSource(source)
-      // Force the <img> to drop the old MJPEG connection and open a fresh one.
-      // Simply changing src to the same URL does nothing — incrementing feedKey
-      // causes React to remount the element with a new cache-busting query param.
-      setFeedKey(k => k + 1)
 
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      setLogs(prev => {
-        const next = [...prev]
-        next.unshift({ time: t, msg: `Video source switched to ${source}`, type: 'primary' })
-        return next.slice(0, MAX_LOG_ENTRIES)
-      })
-    } catch (err) {
-      console.error('Failed to switch source', err)
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      setLogs(prev => {
-        const next = [...prev]
-        next.unshift({ time: t, msg: `Failed to switch to ${source}`, type: 'error' })
-        return next.slice(0, MAX_LOG_ENTRIES)
-      })
-    }
-  }, [])
 
   // ─── Derived display values ───
   const signalLabel = { red: 'Stop', yellow: 'Caution', green: 'Clear' }[traffic.traffic_light] || 'Stop'
@@ -173,17 +147,11 @@ function Dashboard() {
   const signalColorClass = `text-${traffic.traffic_light === 'red' ? 'red' : traffic.traffic_light === 'yellow' ? 'yellow' : 'green'}`
 
   // Video feed URL — feedKey increment forces a fresh MJPEG connection after source switch
-  const videoSrc = isVideoVisible ? `/video_feed?k=${feedKey}` : ''
+  const videoSrc = isVideoVisible ? `/api/video_feed?k=${feedKey}` : ''
 
   return (
     <>
-      {/* Header */}
-      <div className="dash-header">
-        <div>
-          <h2 className="dash-title">Traffic Dashboard</h2>
-          <p className="dash-subtitle">Real-time AI-powered monitoring · Kothrud, Pune</p>
-        </div>
-      </div>
+
 
       {/* KPI cards */}
       <div className="kpi-grid">
@@ -224,15 +192,11 @@ function Dashboard() {
           <div className="data-card cam-panel">
             <div className="cam-header">
               <div className="cam-header-left">
-                <span className="material-symbols-outlined">videocam</span>
-                <span className="cam-header-label">Live Camera Feed</span>
+                <span className="material-symbols-outlined">movie</span>
+                <span className="cam-header-label">Live Video Feed</span>
               </div>
               
-              <div className="source-toggle" style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)' }} onClick={() => switchVideoSource(videoSource === 'video' ? 'webcam' : 'video')}>
-                <div className={`toggle-slider ${videoSource === 'webcam' ? 'webcam' : ''}`} />
-                <span className={`toggle-label ${videoSource === 'video' ? 'active' : ''}`}>VIDEO</span>
-                <span className={`toggle-label ${videoSource === 'webcam' ? 'active' : ''}`}>WEBCAM</span>
-              </div>
+
 
               <span className="cam-badge">
                 <span className="pulse-dot" />
@@ -258,15 +222,6 @@ function Dashboard() {
             </div>
           </div>
 
-          <div className="data-card chart-panel">
-            <div className="chart-panel-header">
-              <span className="chart-panel-label">Flow Patterns (Live)</span>
-              <span className="material-symbols-outlined" style={{ fontSize: 16, color: 'var(--t-variant)' }}>show_chart</span>
-            </div>
-            <div className="chart-wrap">
-              <Line data={chartData} options={chartOpts} />
-            </div>
-          </div>
         </div>
 
         {/* Right column — System Logs only (full height) */}
