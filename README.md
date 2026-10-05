@@ -1,4 +1,4 @@
-﻿---
+---
 title: AI Traffic Moderator
 emoji: 🚦
 colorFrom: red
@@ -543,12 +543,24 @@ This project is intended for **educational and research purposes**. Feel free to
 
 ---
 
-## 👤 Author
+## 👤 Lead Author
 
 **Manaswin Sripatnala**
 
 [![GitHub](https://img.shields.io/badge/GitHub-Manaswin05-181717?style=for-the-badge&logo=github)](https://github.com/Manaswin05)
 [![Hugging Face](https://img.shields.io/badge/HuggingFace-Demo-FFD21F?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/spaces/Manaswin2005/ai-traffic-moderator)
+
+---
+
+## 🤝 Co-Authors
+
+| | Contributor | GitHub |
+|:---:|:---|:---|
+| 👩‍💻 | **Poorva** | [![GitHub](https://img.shields.io/badge/GitHub-poorva234-181717?style=for-the-badge&logo=github)](https://github.com/poorva234) |
+| 👩‍💻 | **Tanushka Chavan** | [![GitHub](https://img.shields.io/badge/GitHub-Tanushka--Chavan-181717?style=for-the-badge&logo=github)](https://github.com/Tanushka-Chavan) |
+| 👩‍💻 | **Niel Mandhare** | [![GitHub](https://img.shields.io/badge/GitHub-nielmandhare-181717?style=for-the-badge&logo=github)](https://github.com/nielmandhare) |
+
+> Built together with passion for smart cities and open-source AI. 🇮🇳
 
 ---
 
