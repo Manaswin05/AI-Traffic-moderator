@@ -1,12 +1,33 @@
+import os
+
+os.environ.setdefault('OMP_NUM_THREADS', '4')
+os.environ.setdefault('MKL_NUM_THREADS', '4')
+
+# =============================================================================
+# AI Traffic Moderator — Parallel Pipeline Architecture
+# =============================================================================
+# Thread 1   (FrameCaptureThread):   cv2.VideoCapture.read() → frame_queue
+#                                     Paced to source FPS for natural playback
+# Thread 2a  (InferenceThread GPU):  frame_queue → YOLO on Arc GPU → result_queue
+# Thread 2b  (InferenceThread NPU):  frame_queue → YOLO on NPU     → result_queue
+#                                     Both pull from the same queue; whichever
+#                                     finishes first pushes to result_queue.
+#                                     This drives BOTH chips simultaneously.
+# Thread 3   (KMeansTrainThread):    wakes on retrain_event, trains off hot path
+# Thread 4   (Flask request thread): result_queue → draw → imencode → MJPEG yield
+# =============================================================================
+# OMP/MKL threads capped at 4 to prevent PyTorch from fighting hybrid CPU cores.
+# =============================================================================
+
 from flask import Flask, render_template, Response, jsonify, send_from_directory, request
 from flask_cors import CORS
 import cv2
 import time
 import torch
 import numpy as np
-import os
 import pickle
 import threading
+import queue
 from sklearn.cluster import KMeans
 from collections import deque
 
@@ -26,13 +47,58 @@ STATIC_FOLDER = os.path.join(os.path.dirname(__file__), 'dist')
 app = Flask(__name__, static_folder=STATIC_FOLDER, static_url_path='')
 CORS(app)
 
-model = YOLO("models/yolov8n.pt")
+# Module-level queues for the parallel pipeline
+frame_queue = queue.Queue(maxsize=2)
+result_queue = queue.Queue(maxsize=2)
 
-# Warm up the YOLO model to prevent first-frame lag when frontend connects
-print("Warming up YOLO model...")
-dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-_ = model(dummy_frame, verbose=False)
-print("[+] YOLO model warmed up and ready!")
+# retrain_event signals KMeansTrainThread to wake and retrain
+retrain_event = threading.Event()
+
+# Lazy-loaded YOLO model — each InferenceThread owns its own instance
+_device = None  # last successfully loaded device name (for status reporting)
+
+
+def _load_model_for_device(device_name):
+    """
+    Load a YOLO OpenVINO model instance for a specific device.
+    Each InferenceThread gets its own model instance — OpenVINO requires
+    separate Core/model objects per execution context.
+    Returns the loaded YOLO model or raises on failure.
+    """
+    OV_MODEL = "models/yolov8n_openvino_model"
+    m = YOLO(OV_MODEL)
+    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    m.predict(dummy, device=device_name, imgsz=640, verbose=False)
+    print(f"[+] YOLO worker ready on {device_name} ✓")
+    return m
+
+
+def _load_best_model():
+    """
+    Single-device fallback loader used when dual-device startup fails.
+    Priority: GPU → NPU → CPU (OpenVINO) → CPU-PT (plain PyTorch)
+    """
+    OV_MODEL = "models/yolov8n_openvino_model"
+    PT_MODEL  = "models/yolov8n.pt"
+
+    if os.path.isdir(OV_MODEL):
+        for device in ("GPU", "NPU", "CPU"):
+            try:
+                m = _load_model_for_device(device)
+                return m, device
+            except Exception as e:
+                print(f"[-] OpenVINO {device} unavailable: {e}")
+
+    print("[!] Falling back to PyTorch CPU model.")
+    m = YOLO(PT_MODEL)
+    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    m.predict(dummy, imgsz=640, verbose=False)
+    print("[+] YOLO loaded via PyTorch CPU ✓")
+    return m, "CPU-PT"
+
+
+VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+
 
 # ---------------------------
 # Camera / Video Initialization
@@ -48,7 +114,7 @@ def init_camera():
         else:
             print(f"WARNING: Found file {video_path} but could not open it (might be a Git LFS pointer).")
 
-    # 2. Try physical webcam only if NOT running in a cloud container (Hugging Face/Render)
+    # 2. Try physical webcam only if NOT running in a cloud container
     is_cloud = os.environ.get("SPACE_ID") or os.environ.get("RENDER") or os.environ.get("PORT") == "7860"
     if not is_cloud:
         for index in [0, 1, 2]:
@@ -66,7 +132,7 @@ def init_camera():
                     ret, frame = cam.read()
                     if ret and frame is not None and frame.size > 0:
                         print(f"SUCCESS: Camera {index} opened. Shape: {frame.shape}")
-                        return cam, False  # (capture, is_video_file)
+                        return cam, False
                     else:
                         cam.release()
             except Exception:
@@ -77,9 +143,6 @@ def init_camera():
     print("WARNING: No camera or video file found. Will stream placeholder frames.")
     return None, False
 
-cap, is_video_file = init_camera()
-
-VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
 # ============================================
 # K-Means Traffic Classification System
@@ -88,118 +151,93 @@ VEHICLE_CLASSES = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
 class TrafficKMeansOptimized:
     """Memory-efficient K-means for traffic classification"""
-    
+
     def __init__(self):
-        # Memory-optimized parameters for Render free tier
-        self.MIN_SAMPLES = 20              # Start with minimal data
-        self.RETRAIN_INTERVAL = 150        # Less frequent retraining
-        self.MAX_DATA_SIZE = 200           # Small rolling window (~1.6KB)
-        
-        # Use deque for memory efficiency (automatic size limit)
+        self.MIN_SAMPLES = 20
+        self.RETRAIN_INTERVAL = 150
+        self.MAX_DATA_SIZE = 200
+
         self.training_data = deque(maxlen=self.MAX_DATA_SIZE)
-        
-        # Model state
+
         self.model = None
         self.cluster_centers = None
         self.samples_since_last_train = 0
         self.last_train_time = time.time()
         self.is_trained = False
-        
+
         # Pre-seed with realistic traffic patterns for immediate operation
-        # This allows K-means to work from the start without waiting
         initial_patterns = [
-            1, 2, 2, 3, 3, 4, 5,           # Low traffic
-            7, 8, 9, 10, 11, 12,           # Medium traffic  
-            15, 17, 18, 20, 22, 25         # High traffic
+            1, 2, 2, 3, 3, 4, 5,       # Low traffic
+            7, 8, 9, 10, 11, 12,        # Medium traffic
+            15, 17, 18, 20, 22, 25      # High traffic
         ]
         for count in initial_patterns:
             self.training_data.append(count)
-        
-        # Try to load existing model
+
         self.load_model()
-        
-        # If no saved model, train with seed data
+
         if not self.is_trained:
             self.train()
-    
+
     def add_sample(self, vehicle_count):
-        """Add new sample and intelligently decide on retraining"""
+        """Add new sample and signal for retraining when threshold is reached"""
         self.training_data.append(vehicle_count)
         self.samples_since_last_train += 1
-        
-        # Decision logic for retraining
+
         should_retrain = False
-        
-        # Periodic retraining after enough new data
         if self.samples_since_last_train >= self.RETRAIN_INTERVAL:
             should_retrain = True
-        
-        # Time-based safety net (retrain every 3 hours minimum)
         elif time.time() - self.last_train_time > 10800:
             should_retrain = True
-        
+
         if should_retrain:
-            self.train()
-            self.save_model()
-    
+            retrain_event.set()
+
     def train(self):
-        """Train K-means model - memory efficient"""
+        """Train K-means model — runs in KMeansTrainThread, never on the hot path"""
         if len(self.training_data) < self.MIN_SAMPLES:
             return
-        
+
         try:
-            # Convert deque to numpy array (shape: n_samples, 1)
             X = np.array(list(self.training_data)).reshape(-1, 1)
-            
-            # Train K-means with 3 clusters (low, medium, high)
+
             self.model = KMeans(
-                n_clusters=3, 
+                n_clusters=3,
                 random_state=42,
-                n_init=10,           # Reduced from default for speed
-                max_iter=100         # Reduced from 300 for speed
+                n_init=10,
+                max_iter=100
             )
             self.model.fit(X)
-            
-            # Sort cluster centers to ensure: 0=low, 1=medium, 2=high
+
             centers = self.model.cluster_centers_.flatten()
             sorted_indices = np.argsort(centers)
-            
-            # Create mapping: old_label -> new_label
             self.label_mapping = {old: new for new, old in enumerate(sorted_indices)}
             self.cluster_centers = np.sort(centers)
-            
+
             self.samples_since_last_train = 0
             self.last_train_time = time.time()
             self.is_trained = True
-            
+
             print(f"[+] K-means trained | Centers: {self.cluster_centers.round(1)}")
-            
+
         except Exception as e:
             print(f"[-] K-means training error: {e}")
-    
+
     def classify(self, vehicle_count):
-        """Classify traffic density - returns (cluster, density_label)"""
+        """Classify traffic density — returns (cluster, density_label)"""
         if not self.is_trained or self.model is None:
-            # Fallback to simple rules if model not ready
             return self._fallback_classification(vehicle_count)
-        
+
         try:
-            # Predict cluster
             cluster = self.model.predict([[vehicle_count]])[0]
-            
-            # Remap to sorted cluster (0=low, 1=medium, 2=high)
             cluster = self.label_mapping[cluster]
-            
-            # Map to density label
             density_labels = {0: "LOW", 1: "MEDIUM", 2: "HIGH"}
             density = density_labels[cluster]
-            
             return cluster, density
-            
         except Exception as e:
             print(f"[-] Classification error: {e}")
             return self._fallback_classification(vehicle_count)
-    
+
     def _fallback_classification(self, vehicle_count):
         """Simple rule-based fallback when model isn't ready"""
         if vehicle_count <= 5:
@@ -208,7 +246,7 @@ class TrafficKMeansOptimized:
             return 1, "MEDIUM"
         else:
             return 2, "HIGH"
-    
+
     def save_model(self):
         """Save model to disk"""
         try:
@@ -224,7 +262,7 @@ class TrafficKMeansOptimized:
             print("[+] Model saved successfully")
         except Exception as e:
             print(f"[-] Model save error: {e}")
-    
+
     def load_model(self):
         """Load model from disk if exists"""
         try:
@@ -239,7 +277,7 @@ class TrafficKMeansOptimized:
             print("[i] No saved model found - will train from seed data")
         except Exception as e:
             print(f"[-] Model load error: {e}")
-    
+
     def get_stats(self):
         """Get model statistics"""
         return {
@@ -251,34 +289,166 @@ class TrafficKMeansOptimized:
         }
 
 
-# Initialize K-means system
-kmeans_system = TrafficKMeansOptimized()
-
-traffic_state = {
-    "signal": "red",
-    "timer": 15,
-    "last_change": time.time(),
-    "vehicle_count": 0,
-    "traffic_density": "LOW",
-    "cluster": 0
-}
-
-
 # ---------------------------
-# Vehicle Detection Function
+# Background Threads
 # ---------------------------
-def detect_vehicles(frame):
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = model(rgb_frame)[0]
-    vehicles = []
 
-    for box in results.boxes:
-        class_id = int(box.cls[0])
-        if class_id in VEHICLE_CLASSES:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            vehicles.append((class_id, (x1, y1, x2, y2)))
+class FrameCaptureThread(threading.Thread):
+    """
+    Thread 1: Reads frames from cv2.VideoCapture → frame_queue.
+    Paces reads to the source FPS so video plays at natural speed.
+    Webcam: no sleep — OS driver already paces frame delivery.
+    """
 
-    return vehicles
+    def __init__(self):
+        super().__init__(daemon=True, name="FrameCapture")
+
+    @staticmethod
+    def _get_frame_delay(capture, is_file):
+        """Return sleep time (seconds) between reads to match source FPS."""
+        if not is_file:
+            return 0.0
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        if fps and 10 <= fps <= 120:
+            return 1.0 / fps
+        return 1.0 / 25.0  # safe default for unknown FPS metadata
+
+    def run(self):
+        while True:
+            if cap is None:
+                time.sleep(0.1)
+                continue
+
+            frame_delay = self._get_frame_delay(cap, is_video_file)
+            loop_start = time.monotonic()
+
+            try:
+                with video_lock:
+                    ret, frame = cap.read()
+            except Exception:
+                ret, frame = False, None
+
+            # Loop video file when it ends
+            if not ret and is_video_file:
+                try:
+                    with video_lock:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                except Exception:
+                    ret, frame = False, None
+
+            if not ret or frame is None or frame.size == 0:
+                time.sleep(0.05)
+                continue
+
+            # Non-blocking put: drop oldest frame if full, keep freshest
+            try:
+                frame_queue.put_nowait(frame)
+            except queue.Full:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    frame_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
+
+            # Pace to source FPS — subtract time already spent on read
+            if frame_delay > 0:
+                elapsed = time.monotonic() - loop_start
+                sleep_for = frame_delay - elapsed
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+
+
+class InferenceThread(threading.Thread):
+    """
+    Thread 2: Pulls frames from frame_queue, runs YOLO on a specific device,
+    pushes (frame, vehicles, vehicle_count) to result_queue.
+
+    Two instances run in parallel — one for GPU, one for NPU — so both
+    Intel chips are active simultaneously. Frames are distributed between
+    workers via the shared frame_queue (thread-safe fair round-robin).
+    """
+
+    def __init__(self, device_name):
+        super().__init__(daemon=True, name=f"Inference-{device_name}")
+        self.device_name = device_name
+        self._model = None  # each thread owns its own YOLO/OpenVINO instance
+
+    def _detect_vehicles(self, frame):
+        """Run YOLO on this thread's assigned device."""
+        results = self._model(
+            frame,
+            verbose=False,
+            imgsz=640,
+            conf=0.4,   # ignore detections below 40% confidence
+            iou=0.45,   # NMS threshold — removes duplicate boxes on same vehicle
+            device=self.device_name,
+        )[0]
+        vehicles = []
+        for box in results.boxes:
+            class_id = int(box.cls[0])
+            if class_id in VEHICLE_CLASSES:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                vehicles.append((class_id, (x1, y1, x2, y2)))
+        return vehicles
+
+    def run(self):
+        global _device
+
+        # Lazy-load this thread's model on its assigned device
+        try:
+            self._model = _load_model_for_device(self.device_name)
+            _device = self.device_name
+        except Exception as e:
+            print(f"[-] InferenceThread {self.device_name} failed to load: {e}")
+            # Fall back so we always have at least one working inference worker
+            try:
+                self._model, self.device_name = _load_best_model()
+                _device = self.device_name
+            except Exception as e2:
+                print(f"[-] Fallback also failed: {e2}")
+                return  # thread exits; the other worker keeps running
+
+        while True:
+            frame = frame_queue.get()  # blocking — fair between both workers
+
+            vehicles = self._detect_vehicles(frame)
+            vehicle_count = len(vehicles)
+            kmeans_system.add_sample(vehicle_count)
+
+            # Non-blocking put: drop oldest result if full
+            try:
+                result_queue.put_nowait((frame, vehicles, vehicle_count))
+            except queue.Full:
+                try:
+                    result_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    result_queue.put_nowait((frame, vehicles, vehicle_count))
+                except queue.Full:
+                    pass
+
+
+class KMeansTrainThread(threading.Thread):
+    """
+    Thread 3: Waits on retrain_event, then retrains K-means completely
+    off the hot path so the video stream never stalls during retraining.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="KMeansTrain")
+
+    def run(self):
+        while True:
+            retrain_event.wait(timeout=10800)  # wake on signal or every 3 hours
+            retrain_event.clear()
+            if kmeans_system is not None:
+                kmeans_system.train()
+                kmeans_system.save_model()
 
 
 # ---------------------------
@@ -286,7 +456,6 @@ def detect_vehicles(frame):
 # ---------------------------
 def make_placeholder_frame(message="No camera available"):
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
-    # Dark background with grid lines for visual interest
     for i in range(0, 640, 40):
         cv2.line(frame, (i, 0), (i, 480), (20, 20, 20), 1)
     for i in range(0, 480, 40):
@@ -300,92 +469,54 @@ def make_placeholder_frame(message="No camera available"):
 
 
 # ---------------------------
-# Video Processing Generator
+# Video Processing Generator (Flask encoding — Thread 4)
 # ---------------------------
 def process_frame():
     global cap, is_video_file
 
-    consecutive_failures = 0
-
     while True:
-        current_cap = cap
-        
-        if current_cap is None:
-            frame_bytes = make_placeholder_frame("No camera / video source found")
+        try:
+            frame, vehicles, vehicle_count = result_queue.get(timeout=2.0)
+        except queue.Empty:
+            # Timeout: yield placeholder and keep waiting
+            if cap is None:
+                frame_bytes = make_placeholder_frame("No camera / video source found")
+            else:
+                frame_bytes = make_placeholder_frame("Camera disconnected or loading...")
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(1)
             continue
 
-        try:
-            with video_lock:
-                ret, frame = current_cap.read()
-        except Exception:
-            ret, frame = False, None
-
-        # Loop video file when it ends
-        if not ret and is_video_file:
-            try:
-                with video_lock:
-                    current_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ret, frame = current_cap.read()
-            except Exception:
-                ret, frame = False, None
-
-        if not ret or frame is None or frame.size == 0:
-            consecutive_failures += 1
-
-            if consecutive_failures >= 10:
-                frame_bytes = make_placeholder_frame("Camera disconnected or loading...")
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                time.sleep(1)
-                consecutive_failures = 0
-            else:
-                time.sleep(0.05)
-            continue
-
-        consecutive_failures = 0
-
-        vehicles = detect_vehicles(frame)
-        vehicle_count = len(vehicles)
-
+        # Draw bounding boxes
         for class_id, bbox in vehicles:
             x1, y1, x2, y2 = bbox
             label = VEHICLE_CLASSES[class_id]
-            color = (0, 255, 0)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # === K-MEANS TRAFFIC CLASSIFICATION ===
-        # Add sample for continuous learning
-        kmeans_system.add_sample(vehicle_count)
-        
-        # Classify current traffic density
+        # K-Means classification
         cluster, density = kmeans_system.classify(vehicle_count)
-        
-        # Update traffic state
+
         traffic_state["vehicle_count"] = vehicle_count
         traffic_state["traffic_density"] = density
         traffic_state["cluster"] = cluster
-        
-        # === AI-DRIVEN SIGNAL LOGIC ===
+
+        # AI-driven signal logic
         current_time = time.time()
         elapsed_time = current_time - traffic_state["last_change"]
 
         if elapsed_time >= traffic_state["timer"]:
             if traffic_state["signal"] == "red":
-                # Use AI classification instead of fixed thresholds
                 if density == "HIGH":
                     traffic_state["signal"] = "green"
-                    traffic_state["timer"] = 20  # Longer green for high traffic
+                    traffic_state["timer"] = 20
                 elif density == "MEDIUM":
                     traffic_state["signal"] = "yellow"
                     traffic_state["timer"] = 8
-                else:  # LOW
+                else:
                     traffic_state["signal"] = "red"
-                    traffic_state["timer"] = 10  # Short red for low traffic
+                    traffic_state["timer"] = 10
             elif traffic_state["signal"] == "green":
                 traffic_state["signal"] = "yellow"
                 traffic_state["timer"] = 4
@@ -395,13 +526,12 @@ def process_frame():
 
             traffic_state["last_change"] = current_time
 
-        # Overlay text on frame with AI info
+        # Overlay
         signal_colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0)}
-        sig_color = signal_colors.get(traffic_state["signal"], (255, 255, 255))
-        
         density_colors = {"LOW": (0, 255, 0), "MEDIUM": (0, 255, 255), "HIGH": (0, 0, 255)}
+        sig_color = signal_colors.get(traffic_state["signal"], (255, 255, 255))
         dens_color = density_colors.get(density, (255, 255, 255))
-        
+
         cv2.putText(frame, f"Signal: {traffic_state['signal'].upper()}",
                     (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, sig_color, 2)
         cv2.putText(frame, f"Vehicles: {vehicle_count}",
@@ -411,12 +541,9 @@ def process_frame():
         cv2.putText(frame, f"Cluster: {cluster}",
                     (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
 
-        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-
-        # Throttle to ~15 fps to reduce CPU on cloud
-        time.sleep(0.067)
 
 
 # ---------------------------
@@ -464,6 +591,7 @@ def set_video_source():
             is_video_file = False
         return jsonify({"status": "error", "message": "Demo video not found"}), 404
 
+
 @app.route('/video_feed')
 def video_feed():
     return Response(process_frame(),
@@ -473,6 +601,7 @@ def video_feed():
 @app.route('/traffic_status')
 def traffic_status():
     stats = kmeans_system.get_stats()
+    active_devices = [t.device_name for t in _inference_threads if t.is_alive()]
     return jsonify({
         "traffic_light": traffic_state["signal"],
         "vehicle_count": traffic_state["vehicle_count"],
@@ -480,7 +609,8 @@ def traffic_status():
         "cluster": traffic_state["cluster"],
         "model_trained": stats["trained"],
         "samples_collected": stats["samples_collected"],
-        "cluster_centers": stats["cluster_centers"]
+        "cluster_centers": stats["cluster_centers"],
+        "inference_devices": active_devices,  # e.g. ["GPU", "NPU"]
     })
 
 
@@ -506,11 +636,44 @@ def train_model():
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_react(path):
-    # If the path is a static file that exists, serve it
     if path and os.path.exists(os.path.join(app.static_folder, path)):
         return send_from_directory(app.static_folder, path)
-    # Otherwise serve index.html (React Router handles the rest)
     return send_from_directory(app.static_folder, 'index.html')
+
+
+# ---------------------------
+# Startup sequence
+# ---------------------------
+
+# Initialize K-means
+kmeans_system = TrafficKMeansOptimized()
+
+# Initialize capture
+cap, is_video_file = init_camera()
+
+traffic_state = {
+    "signal": "red",
+    "timer": 15,
+    "last_change": time.time(),
+    "vehicle_count": 0,
+    "traffic_density": "LOW",
+    "cluster": 0
+}
+
+# Start capture thread
+_capture_thread = FrameCaptureThread()
+_capture_thread.start()
+
+# Start one inference worker per hardware device (GPU + NPU run concurrently)
+_inference_threads = []
+for _dev in ("GPU", "NPU"):
+    t = InferenceThread(_dev)
+    t.start()
+    _inference_threads.append(t)
+
+# Start K-means background retraining thread
+_kmeans_train_thread = KMeansTrainThread()
+_kmeans_train_thread.start()
 
 
 # ---------------------------
