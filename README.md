@@ -288,9 +288,44 @@ npm run dev
 
 > **Note:** Use any username/password on the login screen — authentication is in demo mode.
 
+
+---
+
+## 🎛️ Usage — Video / Webcam Toggle
+
+Once the app is running, open `http://localhost:3000` and go to the **Dashboard** tab. You'll see the **Live Camera Feed** panel at the top-left. In its header bar there is a sliding toggle switch:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 📷  Live Camera Feed   [ VIDEO | WEBCAM ]   ● CAM-01    │
+│                         ▲ click to switch               │
+│                                                         │
+│   ┌─────────────────────────────────────────────────┐   │
+│   │           Annotated video stream                │   │
+│   │   [car]        [truck]      [motorcycle]        │   │
+│   │   Signal: GREEN  Vehicles: 14  AI: HIGH         │   │
+│   └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+| Mode | What happens |
+|:---|:---|
+| **VIDEO** *(default)* | Streams `demo_traffic.mp4` — works everywhere including cloud |
+| **WEBCAM** | Switches to your physical webcam (index 0→1→2 auto-detected) |
+
+**How to switch:**
+
+1. Click the `[ VIDEO \| WEBCAM ]` toggle in the camera panel header
+2. The slider pill animates to the selected side
+3. The backend calls `POST /set_video_source` and hot-swaps the capture source
+4. The **System Logs** panel on the right confirms: `Video source switched to webcam`
+
+> **Note:** Webcam switching works **locally only**. On Render / Hugging Face Spaces, no physical camera is available — the toggle gracefully falls back and logs `Failed to switch to webcam`.
+
 ---
 
 ## 🐳 Docker Deployment
+
 
 ```bash
 # Build production frontend
