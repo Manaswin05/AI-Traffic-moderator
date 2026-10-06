@@ -1,13 +1,3 @@
----
-title: AI Traffic Moderator
-emoji: 🚦
-colorFrom: red
-colorTo: green
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 <div align="center">
 
 <img src="assets/banner_hero.jpg" alt="AI Traffic Moderator — Smart city intersection with YOLOv8 detection and neural network overlay" width="100%" style="border-radius:12px" />
