@@ -1,7 +1,7 @@
 import os
 
-os.environ.setdefault('OMP_NUM_THREADS', '4')
-os.environ.setdefault('MKL_NUM_THREADS', '4')
+os.environ.setdefault('OMP_NUM_THREADS', '3')
+os.environ.setdefault('MKL_NUM_THREADS', '3')
 
 # =============================================================================
 # AI Traffic Moderator — Parallel Pipeline Architecture
@@ -48,8 +48,8 @@ app = Flask(__name__, static_folder=STATIC_FOLDER, static_url_path='')
 CORS(app)
 
 # Module-level queues for the parallel pipeline
-frame_queue = queue.Queue(maxsize=2)
-result_queue = queue.Queue(maxsize=2)
+frame_queue = queue.Queue(maxsize=5)
+result_queue = queue.Queue(maxsize=5)
 
 # retrain_event signals KMeansTrainThread to wake and retrain
 retrain_event = threading.Event()
@@ -291,16 +291,19 @@ class FrameCaptureThread(threading.Thread):
                 time.sleep(0.05)
                 continue
 
+            frame_idx = getattr(self, 'frame_idx', 0) + 1
+            self.frame_idx = frame_idx
+
             # Non-blocking put: drop oldest frame if full, keep freshest
             try:
-                frame_queue.put_nowait(frame)
+                frame_queue.put_nowait((frame_idx, frame))
             except queue.Full:
                 try:
                     frame_queue.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    frame_queue.put_nowait(frame)
+                    frame_queue.put_nowait((frame_idx, frame))
                 except queue.Full:
                     pass
 
@@ -332,7 +335,7 @@ class InferenceThread(threading.Thread):
         results = self._model(
             frame,
             verbose=False,
-            imgsz=640,
+            imgsz=320,  # Reduced from 640 for significantly faster inference
             conf=0.4,   # ignore detections below 40% confidence
             iou=0.45,   # NMS threshold — removes duplicate boxes on same vehicle
             device="cpu",
@@ -363,7 +366,11 @@ class InferenceThread(threading.Thread):
                 return  # thread exits; the other worker keeps running
 
         while True:
-            frame = frame_queue.get()  # blocking — fair between both workers
+            frame_data = frame_queue.get()  # blocking — fair between both workers
+            if isinstance(frame_data, tuple):
+                frame_idx, frame = frame_data
+            else:
+                frame_idx, frame = 0, frame_data
 
             vehicles = self._detect_vehicles(frame)
             vehicle_count = len(vehicles)
@@ -371,14 +378,14 @@ class InferenceThread(threading.Thread):
 
             # Non-blocking put: drop oldest result if full
             try:
-                result_queue.put_nowait((frame, vehicles, vehicle_count))
+                result_queue.put_nowait((frame_idx, frame, vehicles, vehicle_count))
             except queue.Full:
                 try:
                     result_queue.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    result_queue.put_nowait((frame, vehicles, vehicle_count))
+                    result_queue.put_nowait((frame_idx, frame, vehicles, vehicle_count))
                 except queue.Full:
                     pass
 
@@ -424,9 +431,16 @@ def make_placeholder_frame(message="No camera available"):
 def process_frame():
     global cap, is_video_file
 
+    last_rendered_idx = -1
+
     while True:
         try:
-            frame, vehicles, vehicle_count = result_queue.get(timeout=2.0)
+            result = result_queue.get(timeout=2.0)
+            if len(result) == 4:
+                frame_idx, frame, vehicles, vehicle_count = result
+            else:
+                frame_idx = last_rendered_idx + 1
+                frame, vehicles, vehicle_count = result
         except queue.Empty:
             # Timeout: yield placeholder and keep waiting
             if cap is None:
@@ -436,6 +450,11 @@ def process_frame():
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             continue
+
+        # Skip out-of-order older frames to prevent video jitter/stutter
+        if frame_idx < last_rendered_idx:
+            continue
+        last_rendered_idx = frame_idx
 
         # Draw bounding boxes
         for class_id, bbox in vehicles:
@@ -476,20 +495,7 @@ def process_frame():
 
             traffic_state["last_change"] = current_time
 
-        # Overlay
-        signal_colors = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0)}
-        density_colors = {"LOW": (0, 255, 0), "MEDIUM": (0, 255, 255), "HIGH": (0, 0, 255)}
-        sig_color = signal_colors.get(traffic_state["signal"], (255, 255, 255))
-        dens_color = density_colors.get(density, (255, 255, 255))
-
-        cv2.putText(frame, f"Signal: {traffic_state['signal'].upper()}",
-                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, sig_color, 2)
-        cv2.putText(frame, f"Vehicles: {vehicle_count}",
-                    (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-        cv2.putText(frame, f"AI Density: {density}",
-                    (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, dens_color, 2)
-        cv2.putText(frame, f"Cluster: {cluster}",
-                    (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        # Overlay rendering removed as requested
 
         _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
         yield (b'--frame\r\n'
@@ -593,10 +599,11 @@ traffic_state = {
 _capture_thread = FrameCaptureThread()
 _capture_thread.start()
 
-# Start one inference worker per hardware device (GPU + NPU run concurrently)
+# Start multiple inference workers for multithreading on the Intel Core Ultra CPU
 _inference_threads = []
-for _dev in ("GPU", "NPU"):
-    t = InferenceThread(_dev)
+# Using 4 threads instead of 2 to take advantage of 14 cores
+for i in range(4):
+    t = InferenceThread(f"Worker-{i}")
     t.start()
     _inference_threads.append(t)
 
