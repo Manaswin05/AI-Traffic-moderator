@@ -10999,7 +10999,7 @@
 		<framework>
 			<author value="Ultralytics" />
 			<batch value="1" />
-			<date value="2026-10-03T12:27:24.377205" />
+			<date value="2026-10-06T16:33:39.981729" />
 			<description value="Ultralytics YOLOv8n model trained on coco.yaml" />
 			<imgsz value="[640, 640]" />
 			<license value="AGPL-3.0 https://ultralytics.com/license" />

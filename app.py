@@ -335,8 +335,8 @@ class InferenceThread(threading.Thread):
         results = self._model(
             frame,
             verbose=False,
-            imgsz=320,  # Reduced from 640 for significantly faster inference
-            conf=0.4,   # ignore detections below 40% confidence
+            imgsz=640,  # Restored to 640 to detect small/distant vehicles
+            conf=0.25,  # Lowered confidence threshold to catch more vehicles
             iou=0.45,   # NMS threshold — removes duplicate boxes on same vehicle
             device="cpu",
         )[0]
