@@ -61,20 +61,6 @@ const MAX_HISTORY = 30
 const typeLabels = ['Cars', 'Bikes', 'Buses', 'Trucks', 'Auto']
 const typeColors = [C.white, C.white2, C.white3, C.white4, C.white5]
 
-/* ── LocalStorage helpers ──────────────────────────── */
-function loadJSON(key, fallback) {
-  try {
-    const saved = localStorage.getItem(key)
-    return saved ? JSON.parse(saved) : fallback
-  } catch {
-    return fallback
-  }
-}
-
-function saveJSON(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value)) } catch { /* quota */ }
-}
-
 function Analytics() {
   const [flowData, setFlowData] = useState({ labels: [], datasets: [{ data: [] }] })
   const [histData, setHistData] = useState({ labels: [], datasets: [] })
@@ -82,9 +68,6 @@ function Analytics() {
   const [freqData, setFreqData] = useState({ labels: [], datasets: [] })
   const [kpis, setKpis] = useState({ total: 0, avgPerCycle: 0, peakCount: 0, cycles: 0 })
 
-  // Mutable refs for data that persists across polls without triggering renders
-  const historyRef = useRef(loadJSON('analyticsHistory', []))
-  const typeAccumRef = useRef(loadJSON('analyticsTypeAccum', { Cars: 0, Bikes: 0, Buses: 0, Trucks: 0, Auto: 0 }))
   const isVisibleRef = useRef(!document.hidden)
 
   // ─── Stable polling callback ───
@@ -93,33 +76,15 @@ function Analytics() {
     if (!isVisibleRef.current) return
 
     try {
-      const { data } = await axios.get('/api/traffic_status')
-      const count = data.vehicle_count || 0
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-
-      const history = historyRef.current
-      history.push({ time: t, count })
-      if (history.length > MAX_HISTORY) history.shift()
-      saveJSON('analyticsHistory', history)
-
-      // Simulate vehicle type breakdown from count
-      const cars  = Math.round(count * 0.45) + Math.floor(Math.random() * 3)
-      const bikes = Math.round(count * 0.25) + Math.floor(Math.random() * 2)
-      const buses = Math.round(count * 0.08) + Math.floor(Math.random() * 2)
-      const trucks = Math.round(count * 0.07) + Math.floor(Math.random() * 1)
-      const auto  = Math.max(0, count - cars - bikes - buses - trucks)
-
-      const ta = typeAccumRef.current
-      ta.Cars  += cars
-      ta.Bikes += bikes
-      ta.Buses += buses
-      ta.Trucks += trucks
-      ta.Auto  += auto
-      saveJSON('analyticsTypeAccum', ta)
+      const { data } = await axios.get('/api/analytics')
+      
+      const history = data.history || []
+      const ta = data.type_accum || { Cars: 0, Bikes: 0, Buses: 0, Trucks: 0, Auto: 0 }
+      const cb = data.current_breakdown || { Cars: 0, Bikes: 0, Buses: 0, Trucks: 0, Auto: 0 }
 
       // KPIs
       const total = history.reduce((s, h) => s + h.count, 0)
-      const peak  = Math.max(...history.map(h => h.count))
+      const peak  = Math.max(...history.map(h => h.count), 0)
       setKpis({
         total,
         avgPerCycle: history.length ? Math.round(total / history.length) : 0,
@@ -176,7 +141,7 @@ function Analytics() {
         labels: ['Cars', 'Bikes', 'Buses', 'Trucks', 'Auto'],
         datasets: [{
           label: 'Current Cycle',
-          data: [cars, bikes, buses, trucks, auto],
+          data: [cb.Cars, cb.Bikes, cb.Buses, cb.Trucks, cb.Auto],
           backgroundColor: [C.white, C.white2, C.white3, C.white4, C.white5],
           borderColor: 'transparent',
           borderRadius: 3,
